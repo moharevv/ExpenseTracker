@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Расходы</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root {
+  --bg: var(--tg-theme-bg-color, #f2f2f7);
+  --fg: var(--tg-theme-text-color, #111);
+  --hint: var(--tg-theme-hint-color, #8e8e93);
+  --card: var(--tg-theme-secondary-bg-color, #fff);
+  --btn: var(--tg-theme-button-color, #2481cc);
+  --btn-text: var(--tg-theme-button-text-color, #fff);
+  --danger: #e5484d;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 12px;
+  padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+  font-family: -apple-system, system-ui, sans-serif;
+  background: var(--bg); color: var(--fg); font-size: 16px;
+}
+.card { background: var(--card); border-radius: 14px; padding: 12px; margin-bottom: 12px; }
+h2 { margin: 4px 0 8px; font-size: 18px; }
+input, select {
+  width: 100%; font-size: 16px; padding: 10px; margin-bottom: 8px;
+  border: 1px solid rgba(128,128,128,.3); border-radius: 10px;
+  background: var(--bg); color: var(--fg); -webkit-appearance: none;
+}
+.row { display: flex; gap: 8px; }
+.row > * { flex: 1; min-width: 0; }
+button {
+  width: 100%; font-size: 16px; padding: 12px; border: none; border-radius: 10px;
+  background: var(--btn); color: var(--btn-text); font-weight: 600;
+}
+.link { background: transparent; color: var(--btn); }
+.total { font-size: 30px; font-weight: 700; margin-top: 2px; }
+.hint { color: var(--hint); font-size: 13px; }
+.cat { display: flex; justify-content: space-between; padding-top: 8px; }
+.bar { height: 6px; background: rgba(128,128,128,.2); border-radius: 3px; overflow: hidden; margin-top: 4px; }
+.bar > div { height: 100%; background: var(--btn); }
+.item { display: flex; align-items: center; gap: 8px; padding: 10px 0; border-bottom: 1px solid rgba(128,128,128,.15); }
+.item:last-child { border-bottom: none; }
+.info { flex: 1; min-width: 0; }
+.note { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.meta { color: var(--hint); font-size: 13px; }
+.amt { font-weight: 600; white-space: nowrap; }
+.del { width: auto; padding: 4px 10px; background: transparent; color: var(--danger); font-size: 18px; }
+.empty { color: var(--hint); text-align: center; padding: 16px 0; }
+</style>
+</head>
+<body>
+
+<div class="card">
+  <input id="month" type="month">
+  <div class="hint">Итого за месяц</div>
+  <div class="total" id="total">0</div>
+</div>
+
+<div class="card" id="byCat"></div>
+
+<div class="card">
+  <div class="row">
+    <input id="amount" type="number" inputmode="decimal" placeholder="Сумма" step="0.01">
+    <input id="date" type="date">
+  </div>
+  <select id="category">
+    <option>Еда</option>
+    <option>Транспорт</option>
+    <option>Дом</option>
+    <option>Развлечения</option>
+    <option>Здоровье</option>
+    <option>Одежда</option>
+    <option>Прочее</option>
+  </select>
+  <input id="note" placeholder="Комментарий" maxlength="60">
+  <button id="add">Добавить</button>
+</div>
+
+<div class="card">
+  <h2>Записи</h2>
+  <div id="list"></div>
+</div>
+
+<div class="card">
+  <button id="copy" class="link">Скопировать CSV за месяц</button>
+</div>
+
+<script>
+const tg = window.Telegram?.WebApp;
+const PREFIX = "exp_";
+const CURRENCY = "₽";
+let expenses = [];
+const $ = id => document.getElementById(id);
+
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const money = n => n.toLocaleString("ru-RU", { maximumFractionDigits: 2 }) + " " + CURRENCY;
+const today = () => new Date().toISOString().slice(0, 10);
+const monthOf = d => d.slice(0, 7);
+
+function alertMsg(text) {
+  tg?.showAlert ? tg.showAlert(text) : alert(text);
+}
+
+// Telegram CloudStorage: данные привязаны к пользователю Telegram.
+// Каждая запись хранится отдельным ключом (лимит на значение — 4 KB).
+// Вне Telegram используется localStorage, чтобы можно было проверить в браузере.
+const store = {
+  getAll(cb) {
+    if (tg?.CloudStorage) {
+      tg.CloudStorage.getKeys((err, keys) => {
+        const ks = (!err && keys) ? keys.filter(k => k.startsWith(PREFIX)) : [];
+        if (!ks.length) return cb([]);
+        tg.CloudStorage.getItems(ks, (err2, values) => {
+          if (err2 || !values) return cb([]);
+          cb(Object.values(values).map(v => {
+            try { return JSON.parse(v); } catch { return null; }
+          }).filter(Boolean));
+        });
+      });
+    } else {
+      const items = Object.keys(localStorage)
+        .filter(k => k.startsWith(PREFIX))
+        .map(k => { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } })
+        .filter(Boolean);
+      cb(items);
+    }
+  },
+  save(item) {
+    const key = PREFIX + item.id, val = JSON.stringify(item);
+    if (tg?.CloudStorage) tg.CloudStorage.setItem(key, val, err => err && alertMsg("Не удалось сохранить"));
+    else localStorage.setItem(key, val);
+  },
+  remove(id) {
+    const key = PREFIX + id;
+    if (tg?.CloudStorage) tg.CloudStorage.removeItem(key);
+    else localStorage.removeItem(key);
+  }
+};
+
+function monthItems() {
+  const m = $("month").value;
+  return expenses
+    .filter(e => monthOf(e.date) === m)
+    .sort((a, b) => b.date.localeCompare(a.date) || b.created - a.created);
+}
+
+function render() {
+  const list = monthItems();
+  const total = list.reduce((s, e) => s + e.amount, 0);
+  $("total").textContent = money(total);
+
+  const byCat = {};
+  list.forEach(e => { byCat[e.category] = (byCat[e.category] || 0) + e.amount; });
+  const cats = Object.entries(byCat).sort((a, b) => b[1] - a[1]);
+  $("byCat").innerHTML = cats.length
+    ? cats.map(([c, v]) => `
+        <div class="cat"><span>${esc(c)}</span><span>${money(v)}</span></div>
+        <div class="bar"><div style="width:${(v / total * 100).toFixed(1)}%"></div></div>`).join("")
+    : '<div class="empty">Нет трат за этот месяц</div>';
+
+  $("list").innerHTML = list.length
+    ? list.map(e => {
+        const [y, m, d] = e.date.split("-");
+        return `
+        <div class="item">
+          <div class="info">
+            <div class="note">${esc(e.note) || esc(e.category)}</div>
+            <div class="meta">${d}.${m} · ${esc(e.category)}</div>
+          </div>
+          <div class="amt">${money(e.amount)}</div>
+          <button class="del" data-id="${esc(e.id)}" aria-label="Удалить">✕</button>
+        </div>`;
+      }).join("")
+    : '<div class="empty">Пока пусто</div>';
+}
+
+function reload() {
+  store.getAll(list => { expenses = list; render(); });
+}
+
+$("add").onclick = () => {
+  const amount = parseFloat($("amount").value);
+  if (!(amount > 0)) return alertMsg("Введите сумму");
+
+  const item = {
+    id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+    amount: Math.round(amount * 100) / 100,
+    category: $("category").value,
+    note: $("note").value.trim(),
+    date: $("date").value || today(),
+    created: Date.now()
+  };
+
+  expenses.push(item);
+  store.save(item);
+
+  // если запись за другой месяц — переключаем просмотр на него
+  if (monthOf(item.date) !== $("month").value) $("month").value = monthOf(item.date);
+
+  $("amount").value = "";
+  $("note").value = "";
+  render();
+  $("amount").focus();
+};
+
+$("list").onclick = e => {
+  const btn = e.target.closest(".del");
+  if (!btn) return;
+  const id = btn.dataset.id;
+  const doDelete = () => {
+    expenses = expenses.filter(x => x.id !== id);
+    store.remove(id);
+    render();
+  };
+  if (tg?.showConfirm) tg.showConfirm("Удалить запись?", ok => ok && doDelete());
+  else if (confirm("Удалить запись?")) doDelete();
+};
+
+$("copy").onclick = async () => {
+  const rows = [
+    "дата;категория;сумма;комментарий",
+    ...monthItems().slice().reverse().map(e =>
+      [e.date, e.category, e.amount, e.note.replace(/;/g, ",")].join(";"))
+  ];
+  try {
+    await navigator.clipboard.writeText(rows.join("\n"));
+    alertMsg("CSV скопирован");
+  } catch {
+    alertMsg("Не удалось скопировать");
+  }
+};
+
+$("month").onchange = render;
+
+$("month").value = monthOf(today());
+$("date").value = today();
+
+if (tg) { tg.ready(); tg.expand(); }
+reload();
+</script>
+</body>
+</html>
